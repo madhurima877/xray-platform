@@ -1,0 +1,142 @@
+# Full X-Ray stack: xray-api (built from ../x-ray) plus the eight services in
+# this repo, PostgreSQL, Redis, Kafka and stand-ins for the relay and KISA.
+#
+#   docker compose up --build
+#   admin-api  http://localhost:8090   (admin / change-me-now from ADMIN_BOOTSTRAP_*)
+#   xray-api   http://localhost:8080   (XRAY_PORT=8088 if 8080 is taken)
+x-svc: &svc
+  build: .
+  restart: unless-stopped
+  depends_on:
+    postgres: { condition: service_healthy }
+    redis: { condition: service_healthy }
+
+x-env: &env
+  DATABASE_URL: postgres://xray:xray@postgres:5432/xray?sslmode=disable
+  REDIS_ADDR: redis:6379
+
+x-kafka-env: &kafka-env
+  <<: *env
+  KAFKA_BROKERS: kafka:9092
+  KAFKA_TOPIC: xray.verdicts
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: xray
+      POSTGRES_PASSWORD: xray
+      POSTGRES_DB: xray
+    ports: ["5434:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U xray"]
+      interval: 2s
+      retries: 30
+
+  redis:
+    image: redis:7.4-alpine
+    ports: ["6381:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      retries: 15
+
+  kafka:
+    image: apache/kafka:3.8.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 3
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 5s
+      retries: 30
+
+  # Creates the topic up front so consumers can join before the first event.
+  kafka-init:
+    image: apache/kafka:3.8.0
+    depends_on:
+      kafka: { condition: service_healthy }
+    entrypoint: ["/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "kafka:9092",
+                 "--create", "--if-not-exists", "--topic", "xray.verdicts", "--partitions", "3"]
+
+  # Outside systems
+  mockext:
+    build: .
+    entrypoint: ["/usr/local/bin/mockext"]
+    ports: ["9000:9000"]
+  mockrelay:
+    build: ../x-ray
+    entrypoint: ["/usr/local/bin/mockrelay"]
+  ai:
+    image: python:3.12-slim
+    volumes: ["../x-ray/ai-service:/app:ro"]
+    command: ["python", "/app/server.py"]
+
+  # A. real-time path (already built, from ../x-ray)
+  xray-api:
+    build: ../x-ray
+    ports: ["${XRAY_PORT:-8080}:8080"]
+    depends_on:
+      redis: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+    environment:
+      REDIS_ADDR: redis:6379
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: xray.verdicts
+      AI_URL: http://ai:8000/score
+      WORKERS: "64"
+    stop_grace_period: 35s
+
+  # B. Kafka consumers
+  stats-worker:
+    <<: *svc
+    entrypoint: ["/usr/local/bin/stats-worker"]
+    environment: { <<: *kafka-env, BATCH_SIZE: "500", FLUSH_EVERY: 1s }
+  audit-worker:
+    <<: *svc
+    entrypoint: ["/usr/local/bin/audit-worker"]
+    environment: { <<: *kafka-env, HISTORY_RETENTION: 2160h }
+  wl-collector:
+    <<: *svc
+    entrypoint: ["/usr/local/bin/wl-collector"]
+    environment: { <<: *kafka-env, WL_MIN_ALLOW: "3" }
+  kisa-reporter:
+    <<: *svc
+    entrypoint: ["/usr/local/bin/kisa-reporter"]
+    environment: { <<: *kafka-env, KISA_REPORT_URL: http://mockext:9000/kisa/report }
+
+  # C. scheduled jobs
+  kisa-collector:
+    <<: *svc
+    entrypoint: ["/usr/local/bin/kisa-collector"]
+    environment: { <<: *env, KISA_LIST_URL: http://mockext:9000/kisa/badurls, EVERY: 1h }
+  master-sync:
+    <<: *svc
+    entrypoint: ["/usr/local/bin/master-sync"]
+    environment: { <<: *env, RELAY_CUSTOMERS_URL: http://mockext:9000/relay/customers, EVERY: 5m }
+  keyword-sync:
+    <<: *svc
+    entrypoint: ["/usr/local/bin/keyword-sync"]
+    environment: { <<: *env, RELAY_KEYWORDS_URL: http://mockext:9000/relay/keywords, EVERY: 30s }
+
+  # D. admin
+  admin-api:
+    <<: *svc
+    entrypoint: ["/usr/local/bin/admin-api"]
+    ports: ["8090:8090"]
+    environment:
+      <<: *env
+      JWT_SECRET: local-dev-secret-change-me-0123456789abcdef
+      ADMIN_BOOTSTRAP_USER: admin
+      ADMIN_BOOTSTRAP_PASSWORD: change-me-now
+      CORS_ORIGIN: http://localhost:5173
