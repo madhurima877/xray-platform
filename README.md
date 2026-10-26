@@ -126,3 +126,4 @@ Consumers: `KAFKA_BROKERS` (required), `KAFKA_TOPIC` (`xray.verdicts`), `KAFKA_G
 - **KISA report and list formats.** `kisa.Report` and `kisa.ParseList`, which accepts plain text, a JSON string array or `[{"url"}]`, are placeholders until the KISA spec arrives.
 - **Relay master-data and keyword APIs.** `GET {customers:[{id,name,callback_url,active,api_keys}]}` and `PUT {version, keywords}` are our guess at the contract.
 - **Sender and URLs in the result event.** xray-api's Kafka event now carries `sender` and `urls` (`x-ray/internal/model.Event`). wl-collector and kisa-reporter need them, while the relay callback body is unchanged.
+# xray-platform
